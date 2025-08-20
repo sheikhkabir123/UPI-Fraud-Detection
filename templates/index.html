@@ -1,0 +1,96 @@
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>UPI Fraud Detection | Demo</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}"/>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+</head>
+<body>
+  <nav class="nav">
+    <div class="brand">UPI Fraud Detection</div>
+    <div class="links">
+      <a href="#">Demo</a>
+      <a href="https://github.com/sheikhkabir123" target="_blank">GitHub</a>
+      <a href="mailto:thesanepsyco@gmail.com">Contact</a>
+    </div>
+  </nav>
+
+  <header class="hero">
+    <h1><span>Real-time</span> Fraud Risk Scoring</h1>
+    <p>Enter transaction details to estimate probability of fraud using a trained ML model.</p>
+  </header>
+
+  <main class="container">
+    <section class="card">
+      <h2>Transaction Form</h2>
+      <form action="/predict" method="POST" class="grid">
+        <label>Amount (₹)<input name="amount" type="number" step="0.01" required value="{{ payload.amount if payload else '' }}"></label>
+        <label>Hour (0-23)<input name="hour" type="number" min="0" max="23" required value="{{ payload.hour if payload else 12 }}"></label>
+        <label>Day of week (0=Mon)<input name="dayofweek" type="number" min="0" max="6" required value="{{ payload.dayofweek if payload else 0 }}"></label>
+        <label>Merchant Category
+          <select name="merchant_category">
+            {% for m in ["food","grocery","utilities","shopping","travel","entertainment","p2p"] %}
+              <option value="{{m}}" {% if payload and payload.merchant_category==m %}selected{% endif %}>{{m}}</option>
+            {% endfor %}
+          </select>
+        </label>
+        <label>Device Changed?
+          <select name="device_change">
+            <option value="0">No</option>
+            <option value="1" {% if payload and payload.device_change==1 %}selected{% endif %}>Yes</option>
+          </select>
+        </label>
+        <label>Location Mismatch?
+          <select name="location_mismatch">
+            <option value="0">No</option>
+            <option value="1" {% if payload and payload.location_mismatch==1 %}selected{% endif %}>Yes</option>
+          </select>
+        </label>
+        <label>Blacklisted Merchant?
+          <select name="is_blacklisted_merchant">
+            <option value="0">No</option>
+            <option value="1" {% if payload and payload.is_blacklisted_merchant==1 %}selected{% endif %}>Yes</option>
+          </select>
+        </label>
+        <label>Recent Chargebacks<input name="recent_chargebacks" type="number" min="0" max="5" value="{{ payload.recent_chargebacks if payload else 0 }}"></label>
+        <label>User Tenure (months)<input name="user_tenure_months" type="number" min="1" value="{{ payload.user_tenure_months if payload else 12 }}"></label>
+        <label>Past Txn Count (7d)<input name="past_txn_count_7d" type="number" min="0" value="{{ payload.past_txn_count_7d if payload else 10 }}"></label>
+        <label>Avg Amount (30d)<input name="avg_amount_30d" type="number" step="0.01" value="{{ payload.avg_amount_30d if payload else 800 }}"></label>
+        <button class="btn" type="submit">Score Transaction</button>
+      </form>
+    </section>
+
+    <section class="card">
+      <h2>Result</h2>
+      {% if score is not none %}
+        <div class="result {{ 'risk' if is_fraud else 'ok' }}">
+          Fraud Probability: <strong>{{ score }}%</strong> — {{ 'High Risk' if is_fraud else 'Likely Legit' }}
+        </div>
+      {% else %}
+        <p>Submit the form to see the fraud probability.</p>
+      {% endif %}
+      <canvas id="featureChart"></canvas>
+    </section>
+  </main>
+
+  <footer class="footer">© {{ 2025 }} UPI Fraud Detection Demo</footer>
+
+  <script>
+    // Simple feature visualization after submission
+    const payload = {{ payload|tojson if payload else 'null' }};
+    if (payload) {
+      const ctx = document.getElementById('featureChart').getContext('2d');
+      const labels = Object.keys(payload);
+      const values = Object.values(payload);
+      new Chart(ctx, {
+        type: 'bar',
+        data: { labels, datasets: [{ label: 'Input features', data: values }] },
+        options: { responsive: true }
+      });
+    }
+  </script>
+</body>
+</html>
