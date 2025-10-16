@@ -1,105 +1,87 @@
-
-import numpy as np
+import argparse
 import pandas as pd
-from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import OneHotEncoder, StandardScaler
-from sklearn.compose import ColumnTransformer
-from sklearn.pipeline import Pipeline
-from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import classification_report, roc_auc_score
+import numpy as np
 import joblib
-import os
+from sklearn.model_selection import train_test_split
+from lightgbm import LGBMClassifier, early_stopping
+from sklearn.metrics import classification_report, precision_recall_curve, auc
+from imblearn.over_sampling import RandomOverSampler
+from sklearn.calibration import CalibratedClassifierCV
+import shap
 
-np.random.seed(42)
+def preprocess_df(df):
+    df = df.copy()
+    df['timestamp'] = pd.to_datetime(df['timestamp'])
+    df['hour'] = df['timestamp'].dt.hour
+    df['dayofweek'] = df['timestamp'].dt.dayofweek
+    df['amount_log'] = np.log1p(df['amount'].astype(float))
+    df = df.sort_values('timestamp')
+    df['payer_tx_count_24h'] = df.groupby('payer_id').cumcount()
+    df['is_night'] = ((df['hour'] < 6) | (df['hour'] >= 22)).astype(int)
 
-# Synthetic data generator for UPI-like transactions
-N = 20000
-amount = np.random.gamma(shape=2.0, scale=500.0, size=N)  # typical UPI amounts skewed
-hour = np.random.randint(0,24,size=N)
-dayofweek = np.random.randint(0,7,size=N)
+    for col in ['merchant_category','device_os','channel','auth_type']:
+        df[col] = df.get(col, '').astype(str)
+        df[col + '_enc'] = df[col].factorize()[0]
 
-merchant_category = np.random.choice(
-    ["food","grocery","utilities","shopping","travel","entertainment","p2p"], size=N, p=[0.15,0.2,0.1,0.2,0.1,0.1,0.15]
-)
+    if 'prev_tx_amount_24h' not in df.columns:
+        df['prev_tx_amount_24h'] = 0.0
 
-device_change = np.random.binomial(1, 0.1, size=N)  # whether device differs from usual
-location_mismatch = np.random.binomial(1, 0.08, size=N)
-is_blacklisted_merchant = np.random.binomial(1, 0.02, size=N)
-recent_chargebacks = np.clip(np.random.poisson(0.05, size=N),0,3)
-user_tenure_months = np.clip(np.random.normal(18, 8, size=N), 1, None).astype(int)
-past_txn_count_7d = np.clip(np.random.poisson(10, size=N),0,100)
-avg_amount_30d = np.random.gamma(2.0, 400.0, size=N)
+    feature_cols = [
+        'amount_log','is_new_payee','payer_tx_count_24h','is_night',
+        'hour','dayofweek',
+        'merchant_category_enc','device_os_enc','channel_enc','auth_type_enc',
+        'prev_tx_amount_24h'
+    ]
+    for c in feature_cols:
+        if c not in df.columns:
+            df[c] = 0
+    return df, feature_cols
 
-# Fraud probability (synthetic rule-based ground truth)
-logit = (
-    0.002*(amount-1000) +
-    0.3*device_change +
-    0.5*location_mismatch +
-    1.2*is_blacklisted_merchant +
-    0.15*(recent_chargebacks>0).astype(int) +
-    0.001*(avg_amount_30d>1500).astype(int) +
-    0.0005*(past_txn_count_7d>25).astype(int) +
-    0.2*((hour<5) | (hour>22)) +
-    0.1*(merchant_category=="shopping").astype(int) +
-    0.15*(merchant_category=="travel").astype(int) -
-    0.01*user_tenure_months
-)
-prob = 1/(1+np.exp(-logit))
-y = (np.random.rand(N) < prob*0.7).astype(int)  # scale base rate ~1-3%
+def train(data_path, out_path):
+    df = pd.read_csv(data_path)
+    df, feature_cols = preprocess_df(df)
+    X = df[feature_cols]
+    y = df['label']
 
-df = pd.DataFrame({
-    "amount": amount.round(2),
-    "hour": hour,
-    "dayofweek": dayofweek,
-    "merchant_category": merchant_category,
-    "device_change": device_change,
-    "location_mismatch": location_mismatch,
-    "is_blacklisted_merchant": is_blacklisted_merchant,
-    "recent_chargebacks": recent_chargebacks,
-    "user_tenure_months": user_tenure_months,
-    "past_txn_count_7d": past_txn_count_7d,
-    "avg_amount_30d": avg_amount_30d.round(2),
-    "is_fraud": y
-})
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42, stratify=y)
 
-os.makedirs("data", exist_ok=True)
-df.to_csv("data/upi_synth.csv", index=False)
+    # oversample minority class to ~5% in training set
+    ros = RandomOverSampler(sampling_strategy=0.05, random_state=42)
+    X_res, y_res = ros.fit_resample(X_train, y_train)
 
-# Train/val split
-X = df.drop(columns=["is_fraud"])
-y = df["is_fraud"]
+    model = LGBMClassifier(n_estimators=1000, learning_rate=0.05, max_depth=9)
+    model.fit(
+        X_res, y_res,
+        eval_set=[(X_test, y_test)],
+        callbacks=[early_stopping(stopping_rounds=50)]
+    )
 
-num_cols = ["amount","hour","dayofweek","device_change","location_mismatch","is_blacklisted_merchant",
-            "recent_chargebacks","user_tenure_months","past_txn_count_7d","avg_amount_30d"]
-cat_cols = ["merchant_category"]
+    # calibrate probabilities using hold-out test set
+    calibrator = CalibratedClassifierCV(model, cv='prefit', method='isotonic')
+    calibrator.fit(X_test, y_test)
 
-pre = ColumnTransformer([
-    ("num", StandardScaler(with_mean=True, with_std=True), num_cols),
-    ("cat", OneHotEncoder(handle_unknown="ignore"), cat_cols)
-])
+    preds = calibrator.predict_proba(X_test)[:,1]
+    precision, recall, _ = precision_recall_curve(y_test, preds)
+    pr_auc = auc(recall, precision)
+    print('PR AUC (calibrated):', pr_auc)
+    try:
+        print(classification_report(y_test, (preds>0.01).astype(int)))
+    except Exception:
+        pass
 
-clf = Pipeline(steps=[
-    ("pre", pre),
-    ("model", LogisticRegression(max_iter=200, class_weight="balanced"))
-])
+    explainer = shap.TreeExplainer(model)
+    artifact = {
+        'model': calibrator,
+        'raw_model': model,
+        'feature_cols': feature_cols,
+        'shap_explainer': explainer
+    }
+    joblib.dump(artifact, out_path)
+    print('Saved artifact to', out_path)
 
-X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, stratify=y, random_state=42)
-clf.fit(X_train, y_train)
-
-y_proba = clf.predict_proba(X_test)[:,1]
-y_pred = (y_proba>0.5).astype(int)
-
-print("AUC:", roc_auc_score(y_test, y_proba))
-print(classification_report(y_test, y_pred))
-
-# Save model and metadata
-joblib.dump(clf, "model.pkl")
-
-meta = {
-    "numerical_features": num_cols,
-    "categorical_features": cat_cols,
-    "classes": ["legit","fraud"]
-}
-import json
-json.dump(meta, open("model_meta.json","w"))
-print("Saved model.pkl and model_meta.json")
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--data', required=True)
+    parser.add_argument('--out', default='model_artifact.pkl')
+    args = parser.parse_args()
+    train(args.data, args.out)
